@@ -52,6 +52,33 @@ type ProductPlan struct {
 	Target   string
 }
 
+// TankState is the persisted view of one receiving tank in the tank book.
+type TankState struct {
+	Name     string  `json:"name"`
+	Capacity float64 `json:"capacity"`
+	Occupied float64 `json:"occupied"`
+	Status   string  `json:"status"` // available | paused
+}
+
+// ShareState is one tank share within a persisted allocation.
+type ShareState struct {
+	Tank    string  `json:"tank"`
+	Planned float64 `json:"planned"`
+	Actual  float64 `json:"actual"`
+	Status  string  `json:"status"` // planned | active | paused | full | complete
+	Reason  string  `json:"reason,omitempty"`
+}
+
+// AllocationState is the persisted multi-tank allocation for one revision.
+type AllocationState struct {
+	Campaign      uuid.UUID    `json:"campaign"`
+	Revision      uuid.UUID    `json:"revision"`
+	Grade         string       `json:"grade"`
+	ExpectedTotal float64      `json:"expected_total"`
+	Phase         string       `json:"phase"` // draft | active | closed
+	Shares        []ShareState `json:"shares"`
+}
+
 type Lease struct {
 	ID       uuid.UUID
 	Owner    string
@@ -71,12 +98,14 @@ type Event struct {
 }
 
 type Snapshot struct {
-	Campaign Campaign
-	Column   Column
-	Reflux   Reflux
-	Reboiler Reboiler
-	Products []string
-	Relief   Relief
+	Campaign    Campaign
+	Column      Column
+	Reflux      Reflux
+	Reboiler    Reboiler
+	Products    []string
+	Tanks       []TankState
+	Allocations []AllocationState
+	Relief      Relief
 }
 
 type Column struct {

@@ -18,6 +18,7 @@ import (
 	"github.com/wyw14/solo-039/internal/relief"
 	"github.com/wyw14/solo-039/internal/utility"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,6 +33,8 @@ type Plant struct {
 	Reboiler          *reboiler.State
 	Analyzer          *analyzer.State
 	Product           *product.Coordinator
+	TankBook          *product.TankBook
+	ProductAllocator  *product.Allocator
 	Interlock         *interlock.Coordinator
 	Relief            *relief.Coordinator
 	Capacity          *utility.Capacity
@@ -61,6 +64,7 @@ func NewPlant(dataDir string) *Plant {
 	analyzerState := analyzer.New()
 	store := journal.New()
 	refluxCoordinator := reflux.NewCoordinator(1)
+	tankBook := product.NewTankBook()
 	plant := &Plant{
 		Campaign:          campaignState,
 		Column:            column.New("T-101"),
@@ -70,6 +74,8 @@ func NewPlant(dataDir string) *Plant {
 		Reboiler:          reboiler.New(),
 		Analyzer:          analyzerState,
 		Product:           product.NewCoordinator(campaignState, analyzerState, store),
+		TankBook:          tankBook,
+		ProductAllocator:  product.NewAllocator(tankBook),
 		Interlock:         interlock.NewCoordinator(),
 		Relief:            relief.NewCoordinator(),
 		Capacity:          utility.NewCapacity(1),
@@ -164,6 +170,7 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 		p.fail(err)
 		return model.Campaign{}, err
 	}
+	p.ProductAllocator.CloseRevision(before.Revision.String())
 	return p.Campaign.Snapshot(), nil
 }
 
@@ -183,20 +190,31 @@ func (p *Plant) CalibrateAnalyzer() uuid.UUID {
 	return revision
 }
 
-func (p *Plant) RouteProduct(target string) error {
+// routePreconditions gathers composition evidence, evaluates the route
+// interlock and advances the campaign to on-spec. It is shared by the legacy
+// single-target route and the multi-tank allocation flow.
+func (p *Plant) routePreconditions() (model.Campaign, model.Proof, error) {
 	current := p.Campaign.Snapshot()
 	proof, ok := p.Analyzer.Proof(current.Revision)
 	if !ok {
-		return errors.New("composition evidence is incomplete")
+		return model.Campaign{}, model.Proof{}, errors.New("composition evidence is incomplete")
 	}
 	_ = p.Evidence.Add(proof)
 	pressureProof := model.Proof{ID: uuid.New(), Revision: current.Revision, Source: "column-pressure", Digest: fmt.Sprintf("%.3f", p.Column.Snapshot().Pressure), Durable: true, Independent: true, At: time.Now().Unix()}
 	permit := p.Interlock.Evaluate([]model.Proof{proof, pressureProof}, model.Campaign{ID: current.ID, Revision: current.Revision, Phase: model.OnSpec, Epoch: current.Epoch, Fencing: current.Fencing})
 	if err := permit.Error(); err != nil {
-		return err
+		return model.Campaign{}, model.Proof{}, err
 	}
 	current.Phase = model.OnSpec
 	campaign.Restore(p.Campaign, current)
+	return current, proof, nil
+}
+
+func (p *Plant) RouteProduct(target string) error {
+	current, proof, err := p.routePreconditions()
+	if err != nil {
+		return err
+	}
 	plan := model.ProductPlan{Campaign: current.ID, Revision: current.Revision, Grade: current.Grade, Target: target}
 	if err := p.Product.PublishWithProof(plan, proof); err != nil {
 		p.ProductAudit.Record(plan, proof, false, err.Error())
@@ -205,6 +223,144 @@ func (p *Plant) RouteProduct(target string) error {
 	}
 	p.ProductAudit.Record(plan, proof, true, "durable proof accepted")
 	return p.record("product.routed", target)
+}
+
+// RegisterTanks records or updates receiving tank capacities and occupied
+// volumes before an allocation is planned.
+func (p *Plant) RegisterTanks(items []product.TankRegistration) ([]product.Tank, error) {
+	tanks, err := p.ProductAllocator.RegisterTanks(items)
+	if err != nil {
+		return nil, err
+	}
+	parts := make([]string, 0, len(tanks))
+	for _, tank := range tanks {
+		parts = append(parts, fmt.Sprintf("%s:%g:%g", tank.Name, tank.Capacity, tank.Occupied))
+	}
+	if err := p.record("tank.registered", strings.Join(parts, ",")); err != nil {
+		p.fail(err)
+		return nil, err
+	}
+	return tanks, nil
+}
+
+func (p *Plant) TankStatus() []product.Tank { return p.TankBook.List() }
+
+// SubmitAllocation validates the per-tank planned volumes against tank
+// capacity and the declared expected total, storing a draft allocation.
+func (p *Plant) SubmitAllocation(expectedTotal float64, requests []product.ShareRequest) (product.Allocation, error) {
+	current := p.Campaign.Snapshot()
+	shares := make([]product.Share, 0, len(requests))
+	for _, request := range requests {
+		shares = append(shares, product.Share{Tank: request.Tank, Planned: request.Planned})
+	}
+	plan := product.Allocation{
+		Campaign:      current.ID,
+		Revision:      current.Revision,
+		Grade:         current.Grade,
+		ExpectedTotal: expectedTotal,
+		Shares:        shares,
+	}
+	allocation, err := p.ProductAllocator.Submit(plan)
+	if err != nil {
+		return product.Allocation{}, err
+	}
+	parts := make([]string, 0, len(allocation.Shares))
+	for _, share := range allocation.Shares {
+		parts = append(parts, fmt.Sprintf("%s=%g", share.Tank, share.Planned))
+	}
+	payload := fmt.Sprintf("%s:%s:%g:%s", allocation.Revision, allocation.Grade, allocation.ExpectedTotal, strings.Join(parts, ","))
+	if err := p.record("product.plan.submitted", payload); err != nil {
+		p.fail(err)
+		return product.Allocation{}, err
+	}
+	return allocation, nil
+}
+
+// ConfirmAllocation activates the draft allocation for the current revision
+// after the same proof/interlock gate used by the legacy route passes. The
+// legacy single-target route is intentionally not opened.
+func (p *Plant) ConfirmAllocation() (product.Allocation, error) {
+	current, proof, err := p.routePreconditions()
+	if err != nil {
+		p.recordAllocationFailure(p.Campaign.Snapshot(), err)
+		return product.Allocation{}, err
+	}
+	if err := journal.PersistProof(p.Journal, proof, current); err != nil {
+		p.recordAllocationFailure(current, err)
+		p.fail(err)
+		return product.Allocation{}, err
+	}
+	allocation, err := p.ProductAllocator.Confirm(current.ID, current.Revision)
+	if err != nil {
+		p.recordAllocationFailure(current, err)
+		return product.Allocation{}, err
+	}
+	for _, share := range allocation.Shares {
+		plan := model.ProductPlan{Campaign: current.ID, Revision: current.Revision, Grade: current.Grade, Target: share.Tank}
+		p.ProductAudit.Record(plan, proof, true, "allocation share confirmed")
+	}
+	parts := make([]string, 0, len(allocation.Shares))
+	for _, share := range allocation.Shares {
+		parts = append(parts, fmt.Sprintf("%s=%g:%s", share.Tank, share.Planned, share.Status))
+	}
+	payload := fmt.Sprintf("%s:%s:%g:%s", allocation.Revision, allocation.Grade, allocation.ExpectedTotal, strings.Join(parts, ","))
+	if err := p.record("product.allocation.confirmed", payload); err != nil {
+		p.fail(err)
+		return product.Allocation{}, err
+	}
+	return allocation, nil
+}
+
+func (p *Plant) recordAllocationFailure(current model.Campaign, cause error) {
+	allocation, ok := p.ProductAllocator.ForRevision(current.Revision.String())
+	if !ok {
+		return
+	}
+	for _, share := range allocation.Shares {
+		plan := model.ProductPlan{Campaign: current.ID, Revision: current.Revision, Grade: current.Grade, Target: share.Tank}
+		p.ProductAudit.Record(plan, model.Proof{}, false, cause.Error())
+	}
+}
+
+// RecordDelivery posts an actual inbound volume to one active share.
+func (p *Plant) RecordDelivery(tank string, amount float64) (product.DeliveryResult, error) {
+	result, _, err := p.ProductAllocator.Deliver(tank, amount)
+	if err != nil {
+		return product.DeliveryResult{}, err
+	}
+	payload := fmt.Sprintf("%s:%g:%g/%g:%s:%g/%g", result.Tank, result.Amount, result.Actual, result.Planned, result.ShareStatus, result.Occupied, result.Capacity)
+	if err := p.record("product.delivered", payload); err != nil {
+		p.fail(err)
+		return product.DeliveryResult{}, err
+	}
+	return result, nil
+}
+
+// PauseTank disconnects one tank and pauses only its allocation share.
+func (p *Plant) PauseTank(name, reason string) error {
+	if err := p.ProductAllocator.PauseTank(name, reason); err != nil {
+		return err
+	}
+	if reason == "" {
+		reason = "disconnected"
+	}
+	if err := p.record("tank.paused", name+":"+reason); err != nil {
+		p.fail(err)
+		return err
+	}
+	return nil
+}
+
+// ResumeTank restores a disconnected tank and its pausable shares.
+func (p *Plant) ResumeTank(name string) error {
+	if err := p.ProductAllocator.ResumeTank(name); err != nil {
+		return err
+	}
+	if err := p.record("tank.resumed", name); err != nil {
+		p.fail(err)
+		return err
+	}
+	return nil
 }
 
 func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error) {
@@ -244,7 +400,7 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 }
 
 func (p *Plant) Snapshot() model.Snapshot {
-	return model.Snapshot{Campaign: p.Campaign.Snapshot(), Column: p.Column.Snapshot(), Reflux: p.RefluxState.Snapshot(), Reboiler: p.Reboiler.Snapshot(), Products: p.ProductTargets(), Relief: p.Relief.State.Snapshot()}
+	return model.Snapshot{Campaign: p.Campaign.Snapshot(), Column: p.Column.Snapshot(), Reflux: p.RefluxState.Snapshot(), Reboiler: p.Reboiler.Snapshot(), Products: p.ProductTargets(), Tanks: p.TankBook.Snapshot(), Allocations: p.ProductAllocator.Snapshot(), Relief: p.Relief.State.Snapshot()}
 }
 
 func (p *Plant) Save() error { return p.Snapshots.Save(p.Snapshot()) }
@@ -262,6 +418,8 @@ func (p *Plant) Restore() error {
 	if err := journal.ValidateRecovery(snapshot, p.Journal.Events()); err != nil {
 		return err
 	}
+	p.TankBook.Restore(snapshot.Tanks)
+	p.ProductAllocator.Restore(snapshot.Allocations)
 	p.mu.Lock()
 	p.started = snapshot.Campaign.Phase != model.Stopped
 	p.mu.Unlock()
@@ -271,11 +429,28 @@ func (p *Plant) Restore() error {
 	return nil
 }
 
+// ProductTargets merges the legacy single target with the non-terminal tank
+// shares of the active allocation, de-duplicated and order-preserving.
 func (p *Plant) ProductTargets() []string {
-	if p.Product.Route.Opened() {
-		return []string{p.Product.Route.Target()}
+	out := make([]string, 0, 4)
+	seen := make(map[string]bool, 4)
+	add := func(target string) {
+		if target != "" && !seen[target] {
+			seen[target] = true
+			out = append(out, target)
+		}
 	}
-	return []string{}
+	if p.Product.Route.Opened() {
+		add(p.Product.Route.Target())
+	}
+	if allocation, ok := p.ProductAllocator.Active(); ok {
+		for _, share := range allocation.Shares {
+			if share.Status == product.ShareActive || share.Status == product.SharePaused || share.Status == product.ShareFull {
+				add(share.Tank)
+			}
+		}
+	}
+	return out
 }
 
 func (p *Plant) Status() map[string]any {
@@ -284,7 +459,7 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "tanks": p.TankStatus(), "allocation": activeAllocationView(p.ProductAllocator), "allocations": p.ProductAllocator.History(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
 }
 
 func (p *Plant) record(kind, payload string) error {
@@ -314,4 +489,11 @@ func (p *Plant) fail(err error) {
 	p.lastError = err.Error()
 	p.mu.Unlock()
 	p.Incidents.Open("runtime", err.Error(), p.Campaign.Snapshot().Revision.String())
+}
+
+func activeAllocationView(allocator *product.Allocator) any {
+	if allocation, ok := allocator.Active(); ok {
+		return allocation
+	}
+	return nil
 }

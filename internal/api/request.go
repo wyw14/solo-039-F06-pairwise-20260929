@@ -18,6 +18,29 @@ type sampleRequest struct {
 type routeRequest struct {
 	Target string `json:"target"`
 }
+type tankInput struct {
+	Name     string  `json:"name"`
+	Capacity float64 `json:"capacity"`
+	Occupied float64 `json:"occupied"`
+}
+type registerTanksRequest struct {
+	Tanks []tankInput `json:"tanks"`
+}
+type shareInput struct {
+	Tank    string  `json:"tank"`
+	Planned float64 `json:"planned"`
+}
+type allocationRequest struct {
+	ExpectedTotal float64      `json:"expected_total"`
+	Shares        []shareInput `json:"shares"`
+}
+type deliveryRequest struct {
+	Tank   string  `json:"tank"`
+	Amount float64 `json:"amount"`
+}
+type pauseTankRequest struct {
+	Reason string `json:"reason"`
+}
 type leaseRequest struct {
 	Owner  string  `json:"owner"`
 	Amount float64 `json:"amount"`

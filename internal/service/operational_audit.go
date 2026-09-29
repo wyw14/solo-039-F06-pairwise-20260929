@@ -203,6 +203,35 @@ func (p *Plant) OperationalAudit() map[string]any {
 	productStateTargets := productState.Targets()
 	productCoordinator.Route.Close()
 
+	tankProbeBook := product.NewTankBook()
+	tankProbeAllocator := product.NewAllocator(tankProbeBook)
+	_, tankProbeRegisterErr := tankProbeAllocator.RegisterTanks([]product.TankRegistration{
+		{Name: "TK-A", Capacity: 10, Occupied: 0},
+		{Name: "TK-B", Capacity: 10, Occupied: 2},
+	})
+	tankProbePlan := product.Allocation{
+		Campaign:      current.ID,
+		Revision:      current.Revision,
+		Grade:         current.Grade,
+		ExpectedTotal: 10,
+		Shares:        []product.Share{{Tank: "TK-A", Planned: 6}, {Tank: "TK-B", Planned: 4}},
+	}
+	_, tankProbeSubmitErr := tankProbeAllocator.Submit(tankProbePlan)
+	tankProbeBadPlan := tankProbePlan
+	tankProbeBadPlan.ExpectedTotal = 9.99
+	_, tankProbeBadSubmitErr := tankProbeAllocator.Submit(tankProbeBadPlan)
+	_, tankProbeConfirmErr := tankProbeAllocator.Confirm(current.ID, current.Revision)
+	_, _, tankProbeDeliverErr := tankProbeAllocator.Deliver("TK-A", 6)
+	_, _, tankProbeOverDeliverErr := tankProbeAllocator.Deliver("TK-A", 0.01)
+	tankProbePauseErr := tankProbeAllocator.PauseTank("TK-B", "probe disconnect")
+	tankProbeResumeErr := tankProbeAllocator.ResumeTank("TK-B")
+	tankProbeTanks := tankProbeBook.Snapshot()
+	tankProbeAllocations := tankProbeAllocator.Snapshot()
+	var tankProbeLive any
+	if live, ok := p.ProductAllocator.Active(); ok {
+		tankProbeLive = live
+	}
+
 	reboilerClone := reboiler.New()
 	reboilerRestoreErr := reboiler.Restore(reboilerClone, snapshot.Reboiler, current)
 	reboilerCoordinator := reboiler.NewCoordinator()
@@ -310,7 +339,7 @@ func (p *Plant) OperationalAudit() map[string]any {
 		"interlock": map[string]any{"explanation": explanation, "sources": evidenceSources, "same_source": sameSource, "heat": heatPermit.Allowed, "route": routePermit, "restored": restoredPermit.Allowed, "recovery_safe": recoverySafe},
 		"journal":   map[string]any{"sequence_error": auditError(sequenceErr), "latest": latestEventPresent, "checkpoint_valid": checkpointValid, "file_path": p.FileLog.Path(), "file_events": len(fileEvents), "file_error": auditError(fileReadErr), "durable_proof": durableProofPresent, "proof_error": auditError(durableProofErr), "recovery_error": auditError(recoveryValidationErr), "recovery_events": len(recoveryEvents), "replay_events": len(replayEvents), "campaign_events": replayedForCampaign, "state_ready": recoveredState.Ready(), "plan_complete": recoveryPlan.Complete(), "generations": len(eventGenerations), "loaded_campaign": loadedSnapshot.Campaign.ID, "load_error": auditError(snapshotLoadErr), "failure_probe_rejected": journalProbeErr != nil},
 		"model":     map[string]any{"plan_error": auditError(planErr), "command_error": auditError(commandErr), "command_key": command.Key(), "ack_matches": ackMatches, "ack_error": auditError(ackErr), "column_limit_error": auditError(columnLimitErr), "energy_limit_error": auditError(energyLimitErr), "safe": limitSafe},
-		"product":   map[string]any{"publish_error": auditError(productPublishErr), "recover_error": auditError(productRecoverErr), "route_error": auditError(productRouteErr), "closed_for_revision": productClose, "transition_error": auditError(productTransitionErr), "durable": productDurable, "routed": productRouted, "recovery_error": auditError(productRecoveryErr), "restore_error": auditError(productRestoreErr), "latest": productLatest, "latest_error": auditError(productLatestErr), "revision_decisions": len(productByRevision), "state_present": productStatePresent, "state_targets": productStateTargets},
+		"product":   map[string]any{"publish_error": auditError(productPublishErr), "recover_error": auditError(productRecoverErr), "route_error": auditError(productRouteErr), "closed_for_revision": productClose, "transition_error": auditError(productTransitionErr), "durable": productDurable, "routed": productRouted, "recovery_error": auditError(productRecoveryErr), "restore_error": auditError(productRestoreErr), "latest": productLatest, "latest_error": auditError(productLatestErr), "revision_decisions": len(productByRevision), "state_present": productStatePresent, "state_targets": productStateTargets, "tank_register_error": auditError(tankProbeRegisterErr), "tank_submit_error": auditError(tankProbeSubmitErr), "tank_bad_submit_error": auditError(tankProbeBadSubmitErr), "tank_confirm_error": auditError(tankProbeConfirmErr), "tank_deliver_error": auditError(tankProbeDeliverErr), "tank_over_deliver_error": auditError(tankProbeOverDeliverErr), "tank_pause_error": auditError(tankProbePauseErr), "tank_resume_error": auditError(tankProbeResumeErr), "tank_count": len(tankProbeTanks), "tank_allocation_count": len(tankProbeAllocations), "live_tanks": p.TankStatus(), "live_allocation": tankProbeLive},
 		"reboiler":  map[string]any{"restore_error": auditError(reboilerRestoreErr), "ramp_error": auditError(reboilerRampErr), "trip_error": auditError(reboilerTripErr), "permit": reboilerPermit, "ramp_apply_error": auditError(reboilerRampApplyErr), "recoverable": reboilerRecoverable, "confirmed": reboilerConfirmed},
 		"reflux":    map[string]any{"ramp_error": auditError(refluxRampErr), "submit_error": auditError(refluxSubmitErr), "pending": len(refluxPending), "lease": refluxLease, "next_error": auditError(refluxNextErr), "cancelled": refluxCancelled},
 		"relief":    map[string]any{"safe": reliefSafe, "shutdown_safe": shutdownSafe, "evaluation_error": auditError(reliefEvaluationErr), "evaluation_safe": reliefEvaluationSafe, "latest": reliefLatest, "latest_present": reliefLatestPresent, "failures": len(reliefFailures), "isolate_error": auditError(reliefIsolateErr)},
