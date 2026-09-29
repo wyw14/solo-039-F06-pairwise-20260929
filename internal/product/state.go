@@ -1,10 +1,13 @@
 package product
 
 import (
-	"github.com/wyw14/solo-039/internal/model"
+	"sort"
 	"sync"
+
+	"github.com/wyw14/solo-039/internal/model"
 )
 
+// State 按罐号保存最近一次启用的路线快照，兼容单罐与多罐计划。
 type State struct {
 	mu     sync.RWMutex
 	routes map[string]Route
@@ -14,7 +17,13 @@ func NewState() *State { return &State{routes: make(map[string]Route)} }
 
 func (s *State) Put(plan model.ProductPlan, route Route) {
 	s.mu.Lock()
-	s.routes[plan.Target] = route
+	if len(plan.Tanks) > 0 {
+		for _, share := range plan.Tanks {
+			s.routes[share.Tank] = route
+		}
+	} else {
+		s.routes[plan.Target] = route
+	}
 	s.mu.Unlock()
 }
 
@@ -32,5 +41,6 @@ func (s *State) Targets() []string {
 	for target := range s.routes {
 		out = append(out, target)
 	}
+	sort.Strings(out)
 	return out
 }

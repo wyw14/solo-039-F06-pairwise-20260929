@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+
+	"github.com/wyw14/solo-039/internal/model"
 )
 
 type transitionRequest struct {
@@ -17,6 +19,21 @@ type sampleRequest struct {
 }
 type routeRequest struct {
 	Target string `json:"target"`
+}
+type tanksRegisterRequest struct {
+	Tanks []model.Tank `json:"tanks"`
+}
+type tankPlanRequest struct {
+	Plans      []model.TankPlan `json:"plans"`
+	BatchTotal float64          `json:"batch_total"`
+}
+type tankIntakeRequest struct {
+	Tank   string  `json:"tank"`
+	Amount float64 `json:"amount"`
+}
+type tankShareRequest struct {
+	Tank   string `json:"tank"`
+	Reason string `json:"reason"`
 }
 type leaseRequest struct {
 	Owner  string  `json:"owner"`

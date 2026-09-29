@@ -160,6 +160,8 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.FeedMetrics.Record(source)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
+	// 切换批次：关闭上一批的多罐路线，罐台账与事件保留供追溯。
+	p.Product.Tanks.CloseRouting()
 	if err := p.record("campaign.transition", grade); err != nil {
 		p.fail(err)
 		return model.Campaign{}, err
@@ -185,14 +187,8 @@ func (p *Plant) CalibrateAnalyzer() uuid.UUID {
 
 func (p *Plant) RouteProduct(target string) error {
 	current := p.Campaign.Snapshot()
-	proof, ok := p.Analyzer.Proof(current.Revision)
-	if !ok {
-		return errors.New("composition evidence is incomplete")
-	}
-	_ = p.Evidence.Add(proof)
-	pressureProof := model.Proof{ID: uuid.New(), Revision: current.Revision, Source: "column-pressure", Digest: fmt.Sprintf("%.3f", p.Column.Snapshot().Pressure), Durable: true, Independent: true, At: time.Now().Unix()}
-	permit := p.Interlock.Evaluate([]model.Proof{proof, pressureProof}, model.Campaign{ID: current.ID, Revision: current.Revision, Phase: model.OnSpec, Epoch: current.Epoch, Fencing: current.Fencing})
-	if err := permit.Error(); err != nil {
+	proof, err := p.requireRoutePermit(current)
+	if err != nil {
 		return err
 	}
 	current.Phase = model.OnSpec
@@ -205,6 +201,153 @@ func (p *Plant) RouteProduct(target string) error {
 	}
 	p.ProductAudit.Record(plan, proof, true, "durable proof accepted")
 	return p.record("product.routed", target)
+}
+
+// requireRoutePermit 在进入合格产品外送阶段前核对成分证据、塔压证据与联锁许可。
+func (p *Plant) requireRoutePermit(current model.Campaign) (model.Proof, error) {
+	proof, ok := p.Analyzer.Proof(current.Revision)
+	if !ok {
+		return model.Proof{}, errors.New("composition evidence is incomplete")
+	}
+	_ = p.Evidence.Add(proof)
+	pressureProof := model.Proof{ID: uuid.New(), Revision: current.Revision, Source: "column-pressure", Digest: fmt.Sprintf("%.3f", p.Column.Snapshot().Pressure), Durable: true, Independent: true, At: time.Now().Unix()}
+	permit := p.Interlock.Evaluate([]model.Proof{proof, pressureProof}, model.Campaign{ID: current.ID, Revision: current.Revision, Phase: model.OnSpec, Epoch: current.Epoch, Fencing: current.Fencing})
+	if err := permit.Error(); err != nil {
+		return model.Proof{}, err
+	}
+	return proof, nil
+}
+
+// RegisterTanks 录入各罐容量与当前占量，台账随快照持久化。
+func (p *Plant) RegisterTanks(tanks []model.Tank) error {
+	if err := p.Product.RegisterTanks(tanks); err != nil {
+		return err
+	}
+	payload, err := encodeEventPayload(map[string]any{"tanks": p.Product.Tanks.Tanks()})
+	if err != nil {
+		return err
+	}
+	return p.record("tank.registered", payload)
+}
+
+// PlanTanks 提交各罐计划量并核对合计；确认前只保存草案，可反复提交。
+func (p *Plant) PlanTanks(plans []model.TankPlan, batchTotal float64) (map[string]any, error) {
+	total, err := p.Product.SubmitTankPlan(plans, batchTotal)
+	if err != nil {
+		return nil, err
+	}
+	draft, submittedTotal, _ := p.Product.Tanks.Draft()
+	payload, err := encodeEventPayload(map[string]any{"batch_total": batchTotal, "total": total, "plans": plans})
+	if err != nil {
+		return nil, err
+	}
+	if err := p.record("tank.plan_submitted", payload); err != nil {
+		p.fail(err)
+		return nil, err
+	}
+	return map[string]any{"batch_total": submittedTotal, "total": total, "plans": draft}, nil
+}
+
+// ConfirmTankPlan 再次核对计划合计后按计划启用多罐路线；事件携带批次身份，
+// 各份额实际入罐量均可追溯到 campaign/revision。
+func (p *Plant) ConfirmTankPlan(plans []model.TankPlan, batchTotal float64) (model.ProductRouting, error) {
+	current := p.Campaign.Snapshot()
+	proof, err := p.requireRoutePermit(current)
+	if err != nil {
+		return model.ProductRouting{}, err
+	}
+	routing, err := p.Product.ConfirmTankPlan(plans, batchTotal)
+	if err != nil {
+		plan := model.ProductPlan{Campaign: current.ID, Revision: current.Revision, Grade: current.Grade, Tanks: plans, BatchTotal: batchTotal}
+		p.ProductAudit.Record(plan, proof, false, err.Error())
+		p.fail(err)
+		return model.ProductRouting{}, err
+	}
+	current.Phase = model.OnSpec
+	campaign.Restore(p.Campaign, current)
+	plan := model.ProductPlan{Campaign: current.ID, Revision: current.Revision, Grade: current.Grade, Tanks: plans, BatchTotal: batchTotal}
+	p.ProductAudit.Record(plan, proof, true, "multi-tank routing confirmed")
+	payload, err := encodeEventPayload(routing)
+	if err != nil {
+		p.fail(err)
+		return model.ProductRouting{}, err
+	}
+	if err := p.record("tank.plan_confirmed", payload); err != nil {
+		p.fail(err)
+		return model.ProductRouting{}, err
+	}
+	return routing, nil
+}
+
+// RecordTankIntake 记录某罐实际入罐量；罐满时只暂停该罐份额。
+func (p *Plant) RecordTankIntake(tank string, amount float64) (model.TankShare, error) {
+	share, err := p.Product.Tanks.RecordIntake(tank, amount)
+	if err != nil {
+		return model.TankShare{}, err
+	}
+	payload, err := encodeEventPayload(map[string]any{"tank": tank, "amount": amount, "share": share})
+	if err != nil {
+		return model.TankShare{}, err
+	}
+	if err := p.record("tank.intake", payload); err != nil {
+		p.fail(err)
+		return model.TankShare{}, err
+	}
+	return share, nil
+}
+
+// PauseTankShare 因罐满或断线只暂停对应罐的份额，其他份额继续接收产品。
+func (p *Plant) PauseTankShare(tank string, reason model.TankStatus) (model.TankShare, error) {
+	share, err := p.Product.Tanks.PauseShare(tank, reason)
+	if err != nil {
+		return model.TankShare{}, err
+	}
+	payload, err := encodeEventPayload(map[string]any{"tank": tank, "reason": reason, "share": share})
+	if err != nil {
+		return model.TankShare{}, err
+	}
+	if err := p.record("tank.share_paused", payload); err != nil {
+		p.fail(err)
+		return model.TankShare{}, err
+	}
+	return share, nil
+}
+
+// ResumeTankShare 恢复被暂停的份额（断线复装且罐未满）。
+func (p *Plant) ResumeTankShare(tank string) (model.TankShare, error) {
+	share, err := p.Product.Tanks.ResumeShare(tank)
+	if err != nil {
+		return model.TankShare{}, err
+	}
+	payload, err := encodeEventPayload(map[string]any{"tank": tank, "share": share})
+	if err != nil {
+		return model.TankShare{}, err
+	}
+	if err := p.record("tank.share_resumed", payload); err != nil {
+		p.fail(err)
+		return model.TankShare{}, err
+	}
+	return share, nil
+}
+
+// TankRoutingStatus 返回罐台账、待确认草案与当前多罐路线。
+func (p *Plant) TankRoutingStatus() map[string]any {
+	draft, batchTotal, total := p.Product.Tanks.Draft()
+	routing, confirmed := p.Product.Tanks.Routing()
+	status := map[string]any{
+		"tanks":       p.Product.Tanks.Tanks(),
+		"draft":       draft,
+		"batch_total": batchTotal,
+		"draft_total": total,
+		"confirmed":   confirmed,
+	}
+	if confirmed {
+		status["routing"] = routing
+		status["open_targets"] = routing.OpenTargets()
+		status["total_planned"] = routing.TotalPlanned()
+		status["total_actual"] = routing.TotalActual()
+	}
+	return status
 }
 
 func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error) {
@@ -244,7 +387,11 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 }
 
 func (p *Plant) Snapshot() model.Snapshot {
-	return model.Snapshot{Campaign: p.Campaign.Snapshot(), Column: p.Column.Snapshot(), Reflux: p.RefluxState.Snapshot(), Reboiler: p.Reboiler.Snapshot(), Products: p.ProductTargets(), Relief: p.Relief.State.Snapshot()}
+	snapshot := model.Snapshot{Campaign: p.Campaign.Snapshot(), Column: p.Column.Snapshot(), Reflux: p.RefluxState.Snapshot(), Reboiler: p.Reboiler.Snapshot(), Products: p.ProductTargets(), Relief: p.Relief.State.Snapshot(), Tanks: p.Product.Tanks.Tanks()}
+	if routing, ok := p.Product.Tanks.Routing(); ok {
+		snapshot.Routing = &routing
+	}
+	return snapshot
 }
 
 func (p *Plant) Save() error { return p.Snapshots.Save(p.Snapshot()) }
@@ -262,6 +409,7 @@ func (p *Plant) Restore() error {
 	if err := journal.ValidateRecovery(snapshot, p.Journal.Events()); err != nil {
 		return err
 	}
+	p.Product.RestoreTanks(snapshot.Tanks, snapshot.Routing)
 	p.mu.Lock()
 	p.started = snapshot.Campaign.Phase != model.Stopped
 	p.mu.Unlock()
@@ -272,6 +420,9 @@ func (p *Plant) Restore() error {
 }
 
 func (p *Plant) ProductTargets() []string {
+	if routing, ok := p.Product.Tanks.Routing(); ok {
+		return routing.OpenTargets()
+	}
 	if p.Product.Route.Opened() {
 		return []string{p.Product.Route.Target()}
 	}
@@ -284,7 +435,7 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "tank_routing": p.TankRoutingStatus(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
 }
 
 func (p *Plant) record(kind, payload string) error {

@@ -203,6 +203,37 @@ func (p *Plant) OperationalAudit() map[string]any {
 	productStateTargets := productState.Targets()
 	productCoordinator.Route.Close()
 
+	tankBook := product.NewTankBook()
+	tankRegisterErr := tankBook.Register([]model.Tank{
+		{ID: "TK-1", Capacity: 100, Occupied: 50},
+		{ID: "TK-2", Capacity: 80, Occupied: 0},
+	})
+	tankInvalidErr := tankBook.Register([]model.Tank{{ID: "BAD", Capacity: 10, Occupied: 20}})
+	tankPlanTotal, tankPlanErr := tankBook.Submit([]model.TankPlan{{Tank: "TK-1", Planned: 50}, {Tank: "TK-2", Planned: 40}}, 90)
+	_, tankMismatchErr := tankBook.Submit([]model.TankPlan{{Tank: "TK-1", Planned: 50}, {Tank: "TK-2", Planned: 40}}, 91)
+	_, tankOverflowErr := tankBook.Submit([]model.TankPlan{{Tank: "TK-1", Planned: 60}}, 60)
+	tankDraftPlans, tankDraftBatch, tankDraftTotal := tankBook.Draft()
+	tankPlan := model.ProductPlan{Campaign: current.ID, Revision: current.Revision, Grade: current.Grade, Tanks: tankDraftPlans, BatchTotal: tankDraftBatch}
+	tankRouting, tankConfirmErr := tankBook.Confirm(tankPlan, 0)
+	_, tankDoubleConfirmErr := tankBook.Confirm(tankPlan, 0)
+	tankConfirmPlanned := tankRouting.TotalPlanned()
+	tankShare, tankIntakeErr := tankBook.RecordIntake("TK-1", 50)
+	_, tankOverPlanErr := tankBook.RecordIntake("TK-2", 41)
+	tankPausedShare, tankPauseErr := tankBook.PauseShare("TK-2", model.TankOffline)
+	tankBadPauseErr := func() error { _, err := tankBook.PauseShare("TK-2", model.TankPaused); return err }()
+	tankRoutingPaused, _ := tankBook.Routing()
+	tankOpenTargets := tankRoutingPaused.OpenTargets()
+	tankTraceable := tankRoutingPaused.Traceable()
+	_, tankResumeFullErr := tankBook.ResumeShare("TK-1")
+	tankResumedShare, tankResumeErr := tankBook.ResumeShare("TK-2")
+	tankRoutingOpen, _ := tankBook.Routing()
+	tankTotalActual := tankRoutingOpen.TotalActual()
+	tankBookRestore := product.NewTankBook()
+	tankBookRestore.Restore(tankBook.Tanks(), &tankRoutingOpen)
+	_, tankRestorePresent := tankBookRestore.Routing()
+	tankBookRestore.CloseRouting()
+	_, tankRestoreClosed := tankBookRestore.Routing()
+
 	reboilerClone := reboiler.New()
 	reboilerRestoreErr := reboiler.Restore(reboilerClone, snapshot.Reboiler, current)
 	reboilerCoordinator := reboiler.NewCoordinator()
@@ -311,6 +342,7 @@ func (p *Plant) OperationalAudit() map[string]any {
 		"journal":   map[string]any{"sequence_error": auditError(sequenceErr), "latest": latestEventPresent, "checkpoint_valid": checkpointValid, "file_path": p.FileLog.Path(), "file_events": len(fileEvents), "file_error": auditError(fileReadErr), "durable_proof": durableProofPresent, "proof_error": auditError(durableProofErr), "recovery_error": auditError(recoveryValidationErr), "recovery_events": len(recoveryEvents), "replay_events": len(replayEvents), "campaign_events": replayedForCampaign, "state_ready": recoveredState.Ready(), "plan_complete": recoveryPlan.Complete(), "generations": len(eventGenerations), "loaded_campaign": loadedSnapshot.Campaign.ID, "load_error": auditError(snapshotLoadErr), "failure_probe_rejected": journalProbeErr != nil},
 		"model":     map[string]any{"plan_error": auditError(planErr), "command_error": auditError(commandErr), "command_key": command.Key(), "ack_matches": ackMatches, "ack_error": auditError(ackErr), "column_limit_error": auditError(columnLimitErr), "energy_limit_error": auditError(energyLimitErr), "safe": limitSafe},
 		"product":   map[string]any{"publish_error": auditError(productPublishErr), "recover_error": auditError(productRecoverErr), "route_error": auditError(productRouteErr), "closed_for_revision": productClose, "transition_error": auditError(productTransitionErr), "durable": productDurable, "routed": productRouted, "recovery_error": auditError(productRecoveryErr), "restore_error": auditError(productRestoreErr), "latest": productLatest, "latest_error": auditError(productLatestErr), "revision_decisions": len(productByRevision), "state_present": productStatePresent, "state_targets": productStateTargets},
+		"tanks":     map[string]any{"register_error": auditError(tankRegisterErr), "invalid_register_error": auditError(tankInvalidErr), "plan_total": tankPlanTotal, "plan_error": auditError(tankPlanErr), "mismatch_error": auditError(tankMismatchErr), "overflow_error": auditError(tankOverflowErr), "draft_total": tankDraftTotal, "confirm_error": auditError(tankConfirmErr), "confirm_planned": tankConfirmPlanned, "double_confirm_error": auditError(tankDoubleConfirmErr), "intake_error": auditError(tankIntakeErr), "over_plan_error": auditError(tankOverPlanErr), "intake_actual": tankShare.Actual, "pause_error": auditError(tankPauseErr), "bad_pause_error": auditError(tankBadPauseErr), "paused_reason": tankPausedShare.Reason, "open_targets": tankOpenTargets, "traceable": tankTraceable, "resume_full_error": auditError(tankResumeFullErr), "resume_error": auditError(tankResumeErr), "resumed_status": tankResumedShare.Status, "total_actual": tankTotalActual, "restore_present": tankRestorePresent, "restore_closed": !tankRestoreClosed},
 		"reboiler":  map[string]any{"restore_error": auditError(reboilerRestoreErr), "ramp_error": auditError(reboilerRampErr), "trip_error": auditError(reboilerTripErr), "permit": reboilerPermit, "ramp_apply_error": auditError(reboilerRampApplyErr), "recoverable": reboilerRecoverable, "confirmed": reboilerConfirmed},
 		"reflux":    map[string]any{"ramp_error": auditError(refluxRampErr), "submit_error": auditError(refluxSubmitErr), "pending": len(refluxPending), "lease": refluxLease, "next_error": auditError(refluxNextErr), "cancelled": refluxCancelled},
 		"relief":    map[string]any{"safe": reliefSafe, "shutdown_safe": shutdownSafe, "evaluation_error": auditError(reliefEvaluationErr), "evaluation_safe": reliefEvaluationSafe, "latest": reliefLatest, "latest_present": reliefLatestPresent, "failures": len(reliefFailures), "isolate_error": auditError(reliefIsolateErr)},

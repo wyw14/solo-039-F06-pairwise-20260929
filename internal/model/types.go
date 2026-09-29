@@ -50,6 +50,10 @@ type ProductPlan struct {
 	Revision uuid.UUID
 	Grade    string
 	Target   string
+	// Tanks 是多罐分配的各罐计划量；为空时退化为单罐 Target 路线。
+	Tanks []TankPlan
+	// BatchTotal 是本批合格产品总量，>0 时要求各罐计划量合计与之核对一致。
+	BatchTotal float64
 }
 
 type Lease struct {
@@ -77,6 +81,10 @@ type Snapshot struct {
 	Reboiler Reboiler
 	Products []string
 	Relief   Relief
+	// Tanks 是已录入容量与占量的罐台账。
+	Tanks []Tank
+	// Routing 是当前确认启用的多罐分配路由，未确认时为 nil。
+	Routing *ProductRouting
 }
 
 type Column struct {
